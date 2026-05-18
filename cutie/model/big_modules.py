@@ -23,6 +23,7 @@ class PixelEncoder(nn.Module):
         super().__init__()
 
         self.is_resnet = 'resnet' in model_cfg.pixel_encoder.type
+        self.is_mobilenet = 'mobilenet' in model_cfg.pixel_encoder.type
         resnet_model_path = model_cfg.get('resnet_model_path')
         if self.is_resnet:
             if model_cfg.pixel_encoder.type == 'resnet18':
@@ -39,17 +40,26 @@ class PixelEncoder(nn.Module):
             self.res2 = network.layer1
             self.layer2 = network.layer2
             self.layer3 = network.layer3
-        else:
-            raise NotImplementedError
+        elif self.is_mobilenet:
+            if model_cfg.pixel_encoder.type == 'mobilenet_v3_small':
+                from torchvision.models import mobilenet_v3_small
+                self.network = mobilenet_v3_small(weights='DEFAULT').features
+            else:
+                raise NotImplementedError
 
     def forward(self, x: torch.Tensor) -> (torch.Tensor, torch.Tensor, torch.Tensor):
-        x = self.conv1(x)
-        x = self.bn1(x)
-        x = self.relu(x)
-        x = self.maxpool(x)
-        f4 = self.res2(x)
-        f8 = self.layer2(f4)
-        f16 = self.layer3(f8)
+        if hasattr(self, 'is_resnet') and self.is_resnet:
+            x = self.conv1(x)
+            x = self.bn1(x)
+            x = self.relu(x)
+            x = self.maxpool(x)
+            f4 = self.res2(x)
+            f8 = self.layer2(f4)
+            f16 = self.layer3(f8)
+        else:
+            f4 = self.network[:2](x)
+            f8 = self.network[2:4](f4)
+            f16 = self.network[4:9](f8)
 
         return f16, f8, f4
 
@@ -98,21 +108,40 @@ class MaskEncoder(nn.Module):
         self.single_object = single_object
         extra_dim = 1 if single_object else 2
 
+        self.is_mobilenet = 'mobilenet' in model_cfg.mask_encoder.type
         resnet_model_path = model_cfg.get('resnet_model_path')
-        if model_cfg.mask_encoder.type == 'resnet18':
-            network = resnet.resnet18(pretrained=True, extra_dim=extra_dim, model_dir=resnet_model_path)
-        elif model_cfg.mask_encoder.type == 'resnet50':
-            network = resnet.resnet50(pretrained=True, extra_dim=extra_dim, model_dir=resnet_model_path)
-        else:
-            raise NotImplementedError
-        self.conv1 = network.conv1
-        self.bn1 = network.bn1
-        self.relu = network.relu
-        self.maxpool = network.maxpool
+        
+        if not self.is_mobilenet:
+            if model_cfg.mask_encoder.type == 'resnet18':
+                network = resnet.resnet18(pretrained=True, extra_dim=extra_dim, model_dir=resnet_model_path)
+            elif model_cfg.mask_encoder.type == 'resnet50':
+                network = resnet.resnet50(pretrained=True, extra_dim=extra_dim, model_dir=resnet_model_path)
+            else:
+                raise NotImplementedError
+            self.conv1 = network.conv1
+            self.bn1 = network.bn1
+            self.relu = network.relu
+            self.maxpool = network.maxpool
 
-        self.layer1 = network.layer1
-        self.layer2 = network.layer2
-        self.layer3 = network.layer3
+            self.layer1 = network.layer1
+            self.layer2 = network.layer2
+            self.layer3 = network.layer3
+        else:
+            if model_cfg.mask_encoder.type == 'mobilenet_v3_small':
+                from torchvision.models import mobilenet_v3_small
+                self.network = mobilenet_v3_small(weights='DEFAULT').features
+                # Modify first layer to accept extra_dim
+                old_conv = self.network[0][0]
+                new_conv = nn.Conv2d(3 + extra_dim, old_conv.out_channels, 
+                                    kernel_size=old_conv.kernel_size, 
+                                    stride=old_conv.stride, 
+                                    padding=old_conv.padding, 
+                                    bias=False)
+                new_conv.weight.data[:, :3] = old_conv.weight.data
+                nn.init.orthogonal_(new_conv.weight.data[:, 3:])
+                self.network[0][0] = new_conv
+            else:
+                raise NotImplementedError
 
         self.distributor = MainToGroupDistributor()
         self.fuser = GroupFeatureFusionBlock(pixel_dim, final_dim, value_dim)
@@ -159,14 +188,17 @@ class MaskEncoder(nn.Module):
             actual_chunk_size = g_chunk.shape[1]
             g_chunk = g_chunk.flatten(start_dim=0, end_dim=1)
 
-            g_chunk = self.conv1(g_chunk)
-            g_chunk = self.bn1(g_chunk)  # 1/2, 64
-            g_chunk = self.maxpool(g_chunk)  # 1/4, 64
-            g_chunk = self.relu(g_chunk)
+            if not self.is_mobilenet:
+                g_chunk = self.conv1(g_chunk)
+                g_chunk = self.bn1(g_chunk)  # 1/2, 64
+                g_chunk = self.maxpool(g_chunk)  # 1/4, 64
+                g_chunk = self.relu(g_chunk)
 
-            g_chunk = self.layer1(g_chunk)  # 1/4
-            g_chunk = self.layer2(g_chunk)  # 1/8
-            g_chunk = self.layer3(g_chunk)  # 1/16
+                g_chunk = self.layer1(g_chunk)  # 1/4
+                g_chunk = self.layer2(g_chunk)  # 1/8
+                g_chunk = self.layer3(g_chunk)  # 1/16
+            else:
+                g_chunk = self.network[:9](g_chunk)  # 1/16
 
             g_chunk = g_chunk.view(batch_size, actual_chunk_size, *g_chunk.shape[1:])
             g_chunk = self.fuser(pix_feat, g_chunk)

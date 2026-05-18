@@ -132,6 +132,7 @@ class MemoryManager:
         Compute affinity and perform readout
         """
         all_readout_mem = {}
+        all_q_weights = {}
         buckets = self.work_mem.buckets
         for bucket_id, bucket in buckets.items():
             if self.use_long_term and self.long_mem.engaged(bucket_id):
@@ -190,9 +191,11 @@ class MemoryManager:
                                                      this_last_mask)
                 this_obj_mem = self._get_object_mem_by_ids(objects)
                 this_obj_mem = this_obj_mem.unsqueeze(2) if this_obj_mem is not None else None
-                readout_memory, aux_features = network.readout_query(pixel_readout, this_obj_mem)
+                readout_memory, aux_features = network.readout_query(pixel_readout, this_obj_mem, need_weights=True)
                 for i, obj in enumerate(objects):
                     all_readout_mem[obj] = readout_memory[:, i]
+                    if aux_features and 'q_weights' in aux_features and aux_features['q_weights'] is not None:
+                        all_q_weights[obj] = aux_features['q_weights'][:, i]
 
                 if self.save_aux:
                     aux_output = {
@@ -204,6 +207,14 @@ class MemoryManager:
                         'attn_mask': aux_features['attn_mask'].float() if aux_features else None,
                     }
                     self.aux = aux_output
+
+        # stack q_weights
+        if all_q_weights:
+            # Sort by object ID to ensure order matches all_obj_ids
+            sorted_objs = sorted(all_q_weights.keys())
+            self.last_q_weights = torch.stack([all_q_weights[obj] for obj in sorted_objs], dim=1)
+        else:
+            self.last_q_weights = None
 
         return all_readout_mem
 

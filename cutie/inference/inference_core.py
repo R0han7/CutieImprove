@@ -77,7 +77,8 @@ class InferenceCore:
                     selection: torch.Tensor,
                     *,
                     is_deep_update: bool = True,
-                    force_permanent: bool = False) -> None:
+                    force_permanent: bool = False,
+                    objects_to_save: Optional[List[int]] = None) -> None:
         """
         Memorize the given segmentation in all memory stores.
 
@@ -109,16 +110,28 @@ class InferenceCore:
             deep_update=is_deep_update,
             chunk_size=self.chunk_size,
             need_weights=self.save_aux)
+        
+        if objects_to_save is None:
+            objects_to_save = self.object_manager.all_obj_ids
+
+        indices_to_save = [self.object_manager.find_tmp_by_id(obj) - 1 for obj in objects_to_save]
+        if len(indices_to_save) == 0:
+            return
+
+        filtered_msk_value = msk_value[:, indices_to_save]
+        filtered_obj_value = obj_value[:, indices_to_save] if obj_value is not None else None
+
         self.memory.add_memory(key,
                                shrinkage,
-                               msk_value,
-                               obj_value,
-                               self.object_manager.all_obj_ids,
+                               filtered_msk_value,
+                               filtered_obj_value,
+                               objects_to_save,
                                selection=selection,
                                as_permanent=as_permanent)
         self.last_mem_ti = self.curr_ti
         if is_deep_update:
-            self.memory.update_sensory(sensory, self.object_manager.all_obj_ids)
+            filtered_sensory = sensory[:, indices_to_save]
+            self.memory.update_sensory(filtered_sensory, objects_to_save)
 
     def _segment(self,
                  key: torch.Tensor,
@@ -136,7 +149,7 @@ class InferenceCore:
                       with strides 16, 8, and 4 respectively
         update_sensory: whether to update the sensory memory
 
-        Returns: (num_objects+1)*H*W normalized probability; the first channel is the background
+        Returns: (num_objects+1)*H*W normalized probability, logits, sensory
         """
         bs = key.shape[0]
         if self.flip_aug:
@@ -152,12 +165,16 @@ class InferenceCore:
 
         memory_readout = self.memory.read(pix_feat, key, selection, self.last_mask, self.network)
         memory_readout = self.object_manager.realize_dict(memory_readout)
-        sensory, _, pred_prob_with_bg = self.network.segment(ms_features,
+        sensory, logits, pred_prob_with_bg = self.network.segment(ms_features,
                                                              memory_readout,
                                                              self.memory.get_sensory(
                                                                  self.object_manager.all_obj_ids),
                                                              chunk_size=self.chunk_size,
                                                              update_sensory=update_sensory)
+        raw_pred_prob_with_bg = pred_prob_with_bg
+        raw_logits = logits
+        raw_sensory = sensory
+
         # remove batch dim
         if self.flip_aug:
             # average predictions of the non-flipped and flipped version
@@ -167,7 +184,7 @@ class InferenceCore:
             pred_prob_with_bg = pred_prob_with_bg[0]
         if update_sensory:
             self.memory.update_sensory(sensory, self.object_manager.all_obj_ids)
-        return pred_prob_with_bg
+        return pred_prob_with_bg, raw_logits, raw_sensory
 
     def step(self,
              image: torch.Tensor,
@@ -246,13 +263,31 @@ class InferenceCore:
         ms_feat, pix_feat = self.image_feature_store.get_features(self.curr_ti, image)
         key, shrinkage, selection = self.image_feature_store.get_key(self.curr_ti, image)
 
+        objects_to_save = None
         # segmentation from memory if needed
         if need_segment:
-            pred_prob_with_bg = self._segment(key,
+            pred_prob_with_bg, raw_logits, raw_sensory = self._segment(key,
                                               selection,
                                               pix_feat,
                                               ms_feat,
                                               update_sensory=update_sensory)
+            
+            # memory gating logic
+            if is_mem_frame and not force_permanent and self.object_manager.num_obj > 0:
+                q_weights = getattr(self.memory, 'last_q_weights', None)
+                gates = self.network.memory_gate(raw_logits, q_weights, raw_sensory)  # B * num_objects * 1
+                gate_mask = (gates > 0.5).squeeze(-1)  # B * num_objects
+                # if flip_aug is used, average the decisions
+                gate_mask = gate_mask.float().mean(dim=0) > 0.5
+                
+                objects_to_save = []
+                for i, obj in enumerate(self.object_manager.all_obj_ids):
+                    if gate_mask[i].item():
+                        objects_to_save.append(obj)
+                
+                if len(objects_to_save) == 0:
+                    # skip memory frame entirely if no object is confident
+                    is_mem_frame = False
 
         # use the input mask if provided
         if mask is not None:
@@ -312,7 +347,8 @@ class InferenceCore:
                              key,
                              shrinkage,
                              selection,
-                             force_permanent=force_permanent)
+                             force_permanent=force_permanent,
+                             objects_to_save=objects_to_save)
 
         if delete_buffer:
             self.image_feature_store.delete(self.curr_ti)

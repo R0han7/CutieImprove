@@ -32,7 +32,8 @@ class Trainer:
         self.cutie = nn.parallel.DistributedDataParallel(CutieTrainWrapper(cfg, stage_cfg).cuda(),
                                                          device_ids=[local_rank],
                                                          output_device=local_rank,
-                                                         broadcast_buffers=False)
+                                                         broadcast_buffers=False,
+                                                         find_unused_parameters=True)
         self.size = stage_cfg['crop_size']
 
         # setting up logging

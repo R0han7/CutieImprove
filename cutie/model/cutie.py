@@ -42,6 +42,7 @@ class CUTIE(nn.Module):
             self.object_transformer = QueryTransformer(model_cfg)
             self.object_summarizer = ObjectSummarizer(model_cfg)
         self.aux_computer = AuxComputer(cfg)
+        self.memory_gate = MemoryGate(self.embed_dim)
 
         self.register_buffer("pixel_mean", torch.Tensor(model_cfg.pixel_mean).view(-1, 1, 1), False)
         self.register_buffer("pixel_std", torch.Tensor(model_cfg.pixel_std).view(-1, 1, 1), False)

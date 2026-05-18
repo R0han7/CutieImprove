@@ -83,3 +83,39 @@ class SensoryDeepUpdater(nn.Module):
             new_h = _recurrent_update(h, values)
 
         return new_h
+
+class MemoryGate(nn.Module):
+    """
+    Learns when to trust the current frame estimate enough to memorize it.
+    Input: per-object uncertainty signals from the transformer and decoder.
+    Output: per-object gate in [0, 1] — hard-thresholded at inference.
+    """
+    def __init__(self, embed_dim: int):
+        super().__init__()
+        self.mlp = nn.Sequential(
+            nn.Linear(3, 32),   # inputs: mask entropy, query attn entropy, sensory norm
+            nn.ReLU(),
+            nn.Linear(32, 1),
+            nn.Sigmoid()
+        )
+
+    def forward(self, logits: torch.Tensor, 
+                attn_weights: torch.Tensor,
+                sensory: torch.Tensor) -> torch.Tensor:
+        # logits: B * (num_obj+1) * H * W
+        prob = logits.softmax(dim=1)
+        mask_entropy = -(prob * prob.clamp(1e-7).log()).sum(dim=1).mean(dim=[-2,-1])
+
+        # attn_weights: B * num_obj * num_heads * num_queries * H * W
+        if attn_weights is not None:
+            attn_entropy = -(attn_weights.mean(2) * 
+                            attn_weights.mean(2).clamp(1e-7).log()).sum(dim=2).mean(dim=[-2,-1])
+        else:
+            # Fallback if object transformer is disabled
+            attn_entropy = torch.zeros_like(mask_entropy)
+
+        sensory_norm = sensory.norm(dim=2).mean(dim=[-2,-1])
+
+        features = torch.stack([mask_entropy, attn_entropy, sensory_norm], dim=-1)
+        gate = self.mlp(features)  # B * num_obj * 1
+        return gate
